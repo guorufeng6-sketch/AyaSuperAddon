@@ -300,9 +300,23 @@ public final class NavigationUI {
         info.addView(TurboStyle.text(host,
             "高德开放平台（lbs.amap.com）→ 注册并实名 → 控制台「应用管理」\n"
             + "→ 创建应用 → 「添加 Key」→ 服务平台选「Android 平台」\n"
-            + "→ 按提示填应用包名 com.rayneo.venus.pub → 复制那串 Key。\n\n"
-            +             "必须选 Android 平台：选「Web 服务」「Web端(JS)」的 Key 用不了。\n"
+            + "→ 包名填 com.rayneo.venus.pub，安全码 SHA1 填下面那串「本机签名 SHA1」\n"
+            + "  （本项目是自签名安装包，填「发布版安全码 SHA1」）→ 复制那串 Key。\n\n"
+            + "★ 关键：Android 平台 Key 绑定「包名 + 签名 SHA1」。\n"
+            + "  · 换了 keystore 重新签名 → SHA1 变了 → 老 Key 立刻失效 —— 这就是\n"
+            + "    「重新输入 Key 仍不可用」的原因：Key 绑的是旧签名的 SHA1，不是 Key 填错。\n"
+            + "  · 别人装这个包时签名跟你不一样 → 别人必须用**他自己的 SHA1** 另申请一个\n"
+            + "    自己的 Key，不能直接借你的用。\n"
+            + "  · 若嫌重签就要换 Key 麻烦，也可试「Web 服务」类型的 Key（不绑签名），\n"
+            + "    能通过下面的自检就用。\n"
             + "不填 Key 则导航、巡航、路况功能无法规划路线。", 13, TurboStyle.MUTED));
+        // 直接把当前安装包的签名 SHA1 摆出来，省得用户去敲 keytool：
+        // Android 平台 Key 必须绑这个 SHA1，换签名就要换 Key。
+        String sha1 = signatureSha1(host);
+        info.addView(TurboStyle.text(host,
+            "本机签名 SHA1（申请 Key 的「发布版安全码」就填这个）：\n"
+            + (sha1.isEmpty() ? "（读取失败，可用 keytool -list -v 取）" : sha1)
+            + "\n包名：" + host.getPackageName(), 12, TurboStyle.BLUE));
 
         TurboStyle.sectionTitle(host, box, "Key");
         EditText field = new EditText(host);
@@ -321,9 +335,22 @@ public final class NavigationUI {
                 own ? TurboStyle.OK : TurboStyle.WARN));
         }
         TurboStyle.button(host, box, "保存", true, () -> {
+            final String k = field.getText().toString().trim();
             host.getSharedPreferences("turboio_settings", 0).edit()
-                .putString("amap_key", field.getText().toString().trim()).apply();
-            Toast.makeText(host, "已保存，重新推送一次导航即可生效", Toast.LENGTH_SHORT).show();
+                .putString("amap_key", k).apply();
+            if (k.isEmpty()) {
+                Toast.makeText(host, "已清空，导航将不可用", Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(host, "已保存，正在自检 Key…", Toast.LENGTH_SHORT).show();
+                // 自检在后台线程发（把高德返回的 infocode 翻成人话），结果回主线程 Toast。
+                final android.content.Context appCtx = host.getApplicationContext();
+                new Thread(() -> {
+                    final String r = NavEngine.probeKey(appCtx, k);
+                    host.runOnUiThread(() -> {
+                        try { Toast.makeText(host, r, Toast.LENGTH_LONG).show(); } catch (Throwable ignored) { }
+                    });
+                }, "TurboIO-amap-probe").start();
+            }
             dialog.dismiss(); NavigationUI.show(host);
         });
         TurboStyle.button(host, box, "清空", false, () -> {
@@ -338,5 +365,31 @@ public final class NavigationUI {
         poller = null;
         shared = null;
         current = null;
+    }
+
+    /**
+     * 当前安装包的签名 SHA1（大写、冒号分隔）。
+     *
+     * ── 为什么把它摆到设置页 ────────────────────────────────────────
+     * Android 平台的高德 Key 必须绑定「包名 + 签名 SHA1」，而这个包是用户
+     * 自己签名的 —— 换一次 keystore（或重装出不同签名）SHA1 就变，老 Key 立刻失效。
+     * 与其让用户去敲 `keytool -list -v`，不如直接把 SHA1 显示在这里，照抄去高德申请。
+     */
+    private static String signatureSha1(android.content.Context app) {
+        try {
+            android.content.pm.PackageInfo info = app.getPackageManager()
+                .getPackageInfo(app.getPackageName(), android.content.pm.PackageManager.GET_SIGNATURES);
+            if (info.signatures == null || info.signatures.length == 0) return "";
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA1");
+            byte[] d = md.digest(info.signatures[0].toByteArray());
+            StringBuilder b = new StringBuilder();
+            for (int i = 0; i < d.length; i++) {
+                if (i > 0) b.append(':');
+                b.append(String.format(java.util.Locale.ROOT, "%02X", d[i]));
+            }
+            return b.toString();
+        } catch (Throwable t) {
+            return "";
+        }
     }
 }

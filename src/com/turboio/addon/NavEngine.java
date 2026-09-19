@@ -43,9 +43,6 @@ import org.json.JSONObject;
  */
 public final class NavEngine {
 
-    /** 高德 Android 平台 Key。用户可在「导航」页里覆盖。 */
-    private static final String AMAP_KEY_DEFAULT = "3e2a782f29aa3b2a36e8741de53282f6";
-
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
     // ---- 当前导航会话状态（进程内单例，够用） ----
@@ -1353,6 +1350,51 @@ public final class NavEngine {
             if (saved != null && !saved.trim().isEmpty()) return saved.trim();
         } catch (Exception ignored) { }
         return "";
+    }
+
+    /**
+     * 用给定 Key 试调一次高德地址解析，返回**给人看**的结论（导航页保存后自检用）。
+     *
+     * ── 为什么需要它 ──────────────────────────────────────────────
+     * 高德出错时 HTTP 依然是 200，真正的错误藏在 body 的 status/info/infocode
+     * （如 `{"status":"0","info":"INVALID_USER_KEY","infocode":"10001"}`）。
+     * 只靠"能不能导航"判断不出 Key 到底哪里不对（类型错 / 没实名 / 限流 / 域名不对）。
+     * 这里把 infocode 翻成人话，让用户一眼知道该改什么。
+     *
+     * ★ 自检**不写** lastReason —— 它是诊断用的旁路，不该污染导航状态。
+     */
+    public static String probeKey(Context app, String key) {
+        if (key == null || key.trim().isEmpty()) return "还没填 Key";
+        try {
+            JSONObject json = probeJson(NavRoute.geocodeUrl(key.trim(), "天安门", "北京"));
+            if ("1".equals(json.optString("status", "0"))) return "✅ Key 可用，导航已就绪";
+            String info = json.optString("info", ""), code = json.optString("infocode", "");
+            return "❌ Key 不可用：" + NavCore.amapReason(info, code)
+                + "（" + (info.isEmpty() ? "?" : info) + " " + code + "）";
+        } catch (Exception e) {
+            String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            return "⚠ 自检没连上（网络？）：" + why;
+        }
+    }
+
+    /** 自检专用 GET：与 getJson 同款，但**不**改 lastReason（免得污染导航状态）。 */
+    private static JSONObject probeJson(String url) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        try {
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(12000);
+            conn.setRequestMethod("GET");
+            int code = conn.getResponseCode();
+            if (code != 200) throw new java.io.IOException("HTTP " + code);
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            try (java.io.InputStream in = conn.getInputStream()) {
+                byte[] buf = new byte[8192]; int n;
+                while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+            }
+            return new JSONObject(out.toString("UTF-8"));
+        } finally {
+            conn.disconnect();
+        }
     }
 
     /**

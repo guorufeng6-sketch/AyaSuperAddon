@@ -7,6 +7,23 @@ import org.json.JSONObject;
 /** Pure-display business 19 bridge, owns only its fresh SID. Never starts ASR. */
 public final class NavGlasses {
     private static final Handler MAIN=new Handler(Looper.getMainLooper());
+    /**
+     * ★ 显示通道的每个入口都必须跑在主线程。
+     *
+     * ── 为什么（用户实测：「天气推不到屏上，而且残留其他应用画面」）──────
+     * 所有推送最终都走 {@link #send}：它用反射调厂商 SDK 的
+     * `manager.u(message, callback)`。这类 SDK 调用**只能在主线程**发，
+     * 从网络线程 / 线程池线程调用会静默失败 —— {@link #push} 里 `send` 抛异常
+     * 被 `catch(Exception)` 吞掉、返回 false；{@link #show} 走进 `uncertain`。
+     * 表现就是"手机端明明查到了、眼镜上却没动，还停在上一个模块的画面"。
+     *
+     * 天气第一次推送正是在 fetch() 的网络线程里调 pushPage() → NavGlasses，
+     * 所以它必挂；而导航 / 倒计时的心跳都在 Handler 主线程，所以没事。
+     *
+     * 这里统一兜底：非主线程一律 post 到主线程再执行。多个调用之间的先后
+     * 顺序由 Handler 的 FIFO 保证（acquire → show → push 的顺序不会乱）。
+     */
+    private static boolean onMain(){return Looper.myLooper()==Looper.getMainLooper();}
     private static volatile String device="",sid="",phase="idle";
     private static String note="眼镜显示未开启",latest="",sent="";
     private static int textSubmitted,textCompleted;private static boolean navigationSession;
@@ -53,6 +70,7 @@ public final class NavGlasses {
     /** 抢占显示通道：返回被让出的那一位的名字（没有则空串）。 */
     public static String acquire(String id){
         if(id==null||id.isEmpty())return "";
+        if(!onMain()){MAIN.post(()->acquire(id));return "";}
         String prev=ownerId,prevLabel=ownerLabel;
         if(!prev.isEmpty()&&!prev.equals(id)){
             Runnable r=releasers.get(prev);
@@ -62,7 +80,11 @@ public final class NavGlasses {
         return prev.isEmpty()||prev.equals(id)?"":prevLabel;
     }
     /** 我先不用了（不关会话，只是别让别人把我当成当前占用者）。 */
-    public static void release(String id){if(id!=null&&id.equals(ownerId)){ownerId="";ownerLabel="";}}
+    public static void release(String id){
+        if(id==null)return;
+        if(!onMain()){MAIN.post(()->release(id));return;}
+        if(id.equals(ownerId)){ownerId="";ownerLabel="";}
+    }
     /**
      * 退出眼镜显示：停掉所有登记过的模块 + 关闭字幕会话。
      * 各页面的「退出眼镜显示」按钮调它。
@@ -75,6 +97,7 @@ public final class NavGlasses {
      * 用户点完按钮发现"通道还是被占"，体验跟以前一模一样。
      */
     public static void releaseAll(){
+        if(!onMain()){MAIN.post(NavGlasses::releaseAll);return;}
         for(java.util.Map.Entry<String,Runnable> e:releasers.entrySet()){
             try{e.getValue().run();}catch(Throwable ignored){}
         }
@@ -84,6 +107,7 @@ public final class NavGlasses {
     }
     /** 无条件把通道清回 idle。**没有** confirmIdle 那种"starting/ready 就早退"的保护。 */
     public static void forceIdle(){
+        if(!onMain()){MAIN.post(NavGlasses::forceIdle);return;}
         MAIN.removeCallbacks(tick);tickRunning=false;
         // 中止可能正在进行中的续接：用户点「退出眼镜显示」后
         // 不能被 1.5 秒后的续接定时器重新开起来。
@@ -105,6 +129,7 @@ public final class NavGlasses {
     public static String connection(){try{return connected().isEmpty()?"眼镜未连接":"已找到官方连接";}catch(Exception e){return "连接信息不可用";}}
     public static boolean start(String text){return start(text,false);}
     public static boolean start(String text,boolean navigation){
+        if(!onMain()){MAIN.post(()->start(text,navigation));return false;}
         NavSessionPolicy.Action action=NavSessionPolicy.action(phase);
         if(action==NavSessionPolicy.Action.REUSE){
             try{if(!device.equals(connected())){stop();return false;}latest=NavCore.clip(text,384);navigationSession=navigation;mark("ready","复用本 App 已确认的显示会话，等待文字更新");return true;}
@@ -144,6 +169,9 @@ public final class NavGlasses {
      */
     public static boolean push(String text){
         if(text==null||text.isEmpty())return false;
+        // 非主线程：转主线程执行。返回值按"会话是否就绪"乐观给 ——
+        // 真正结果由 tick 的回执处理（调用方都不依赖这里的返回值）。
+        if(!onMain()){final String t=text;MAIN.post(()->push(t));return phase.equals("ready");}
         if(!phase.equals("ready")){
             // 未就绪 ≠ 放弃：先把内容记进 latest，等 tick 在会话 ready 后补发。
             // 否则「start() 紧接着 push()」这种写法会把内容整段丢掉
@@ -178,6 +206,7 @@ public final class NavGlasses {
      */
     public static void show(String text,boolean navigation){
         if(text==null||text.isEmpty())return;
+        if(!onMain()){final String t=text;MAIN.post(()->show(t,navigation));return;}
         String clipped=NavCore.clip(text,1024);
         if(phase.equals("ready")){push(clipped);return;}
         latest=clipped;
@@ -236,11 +265,17 @@ public final class NavGlasses {
     }
     /** 是否正在续接（导航页状态行用）。 */
     public static boolean renewing(){return renewing;}
-    public static void stop(){if(phase.equals("idle")||phase.equals("stopping")||phase.equals("uncertain"))return;
+    public static void stop(){
+        if(!onMain()){MAIN.post(NavGlasses::stop);return;}
+        if(phase.equals("idle")||phase.equals("stopping")||phase.equals("uncertain"))return;
         try{mark("stopping","已请求关闭，待确认镜片退出");deadline=SystemClock.elapsedRealtime()+8000;pending=false;send(3,new JSONObject().put("sid",sid).put("reason_code",10).put("text",""));}
         catch(Exception e){mark("uncertain","退出未确认，请用眼镜按钮关闭");}
     }
-    public static void confirmIdle(){if(phase.equals("starting")||phase.equals("ready"))return;MAIN.removeCallbacks(tick);tickRunning=false;sid="";device="";latest="";pending=false;mark("idle","已由用户确认镜片退出");}
+    public static void confirmIdle(){
+        if(!onMain()){MAIN.post(NavGlasses::confirmIdle);return;}
+        if(phase.equals("starting")||phase.equals("ready"))return;
+        MAIN.removeCallbacks(tick);tickRunning=false;sid="";device="";latest="";pending=false;mark("idle","已由用户确认镜片退出");
+    }
     private static void send(int type,JSONObject json)throws Exception{
         if(!device.equals(connected()))throw new IllegalStateException("device_changed");
         Object business=NavReflect.call(NavReflect.type("P3.h"),"valueOf","AI_SUBTITLE"),priority=NavReflect.call(NavReflect.type("E3.b"),"valueOf","NORMAL");

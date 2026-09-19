@@ -50,6 +50,8 @@ final class WeatherUI {
     private static final String DEFAULT_HOST = "qg6tuqynjn.re.qweatherapi.com";
 
     private static final ExecutorService NET = Executors.newSingleThreadExecutor();
+    /** 主线程 Handler：推送必须回主线程（见 pushPage 的注释）。 */
+    private static final android.os.Handler UI = new android.os.Handler(android.os.Looper.getMainLooper());
 
     private static volatile Weather.Now lastNow;
     private static volatile Weather.Air lastAirObj;
@@ -431,11 +433,16 @@ final class WeatherUI {
     static void pushPage(int index) {
         List<String> p = pages;
         if (p == null || p.isEmpty()) return;
-        int i = Math.max(0, Math.min(index, p.size() - 1));
+        final int i = Math.max(0, Math.min(index, p.size() - 1));
         pageIndex = i;
-        NavGlasses.acquire(OWNER);
-        String frame = p.get(i);
-        if (NavGlasses.ready()) NavGlasses.push(frame); else NavGlasses.show(frame, false);
+        final String frame = p.get(i);
+        // ★ 一律回主线程推送。本方法在 fetch() 的网络线程里也会被调用，而 NavGlasses
+        //   的推文最终要用反射调厂商 SDK —— SDK 只能在主线程发，从网络线程调用会
+        //   静默失败：表现就是"天气查到了却推不上屏、眼镜上还残留上一模块的画面"。
+        UI.post(() -> {
+            NavGlasses.acquire(OWNER);
+            if (NavGlasses.ready()) NavGlasses.push(frame); else NavGlasses.show(frame, false);
+        });
     }
 
     static int pageCount() { List<String> p = pages; return p == null ? 0 : p.size(); }
