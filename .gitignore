@@ -1,0 +1,17 @@
+build/
+private/
+runtime/
+node_modules/
+.env
+.env.*
+*.apk
+*.dex
+*.jar
+*.jks
+*.keystore
+*.jsonl
+*.log
+*PrivateBootstrap*
+*.bak*
+*.bak-*
+docs/MIJIA-MCP-INTEGRATION.md
